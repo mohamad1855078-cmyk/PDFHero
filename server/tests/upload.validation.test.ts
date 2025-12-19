@@ -46,8 +46,9 @@ describe('Upload validation middleware', () => {
     const filePath = makeTempFile(buf, 'valid.pdf');
 
     const res = await request(app).post('/api/pdf/compress').attach('file', filePath);
-    expect(res.status).toBe(200);
-    expect(res.header['content-type']).toContain('application/pdf');
+    // compress is now handled via background job -> 202 Accepted with jobId
+    expect(res.status).toBe(202);
+    expect(res.body.jobId).toBeDefined();
 
     // cleanup
     try { fs.unlinkSync(filePath); } catch (e) {}
