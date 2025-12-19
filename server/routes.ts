@@ -12,6 +12,8 @@ import { createPDFProvider } from "./pdf-provider";
 import { log } from "./index";
 import { escapeHtml, buildSafeHtml } from "./utils/sanitize";
 import validateUpload from './middleware/validateUpload';
+import { initQueue, getQueue } from './queue/index';
+import { startWorker, getWorkerQueue } from './queue/worker';
 
 // Cache for Chromium path to avoid repeated lookups
 let cachedChromiumPath: string | null = null;
@@ -125,184 +127,45 @@ export async function registerRoutes(
   app: Express
 ): Promise<Server> {
   const pdfProvider = createPDFProvider();
+  // start background worker for heavy PDF tasks
+  try { startWorker(); } catch (e: any) { log(`Failed to start worker: ${e?.message || e}`); }
 
   // Health check
   app.get("/api/health", (_req, res) => {
     res.json({ status: "ok", provider: process.env.PDF_PROVIDER || "mock" });
   });
 
-  // Merge PDFs
+  // Merge PDFs (enqueue)
   app.post("/api/pdf/merge", upload.array("files", 50), validateUpload, async (req, res) => {
     try {
       const files = req.files as Express.Multer.File[];
       const mode = (req.body?.mode || 'fast') as 'fast' | 'compress';
-      
-      if (!files || files.length < 2) {
-        return res.status(400).json({ error: "At least 2 PDF files are required" });
-      }
-
-      log(`Merging ${files.length} PDFs with mode: ${mode}`);
-
+      if (!files || files.length < 2) return res.status(400).json({ error: "At least 2 PDF files are required" });
       const filePaths = files.map((f) => f.path);
-      const mergedPDF = await pdfProvider.mergePDFs(filePaths, { compress: mode === 'compress' });
-
-      // Clean up uploaded files
-      filePaths.forEach((fp) => {
-        try {
-          fs.unlinkSync(fp);
-        } catch {}
-      });
-
-      // Save merged PDF to RAM disk for fast access
-      const downloadId = `merge-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-      const downloadPath = path.join(DOWNLOADS_DIR, `${downloadId}.pdf`);
-      
-      try {
-        await fs.promises.writeFile(downloadPath, mergedPDF);
-        log(`Merged PDF saved: ${downloadPath}`);
-      } catch (writeError: any) {
-        log(`Error writing PDF file: ${writeError.message}`);
-        throw new Error(`Failed to save merged PDF: ${writeError.message}`);
-      }
-
-      res.json({
-        success: true,
-        downloadId,
-        downloadUrl: `/api/pdf/download/${downloadId}`,
-        expiresIn: 3600
-      });
+      const queue = getQueue();
+      const job = queue.enqueue('merge', { filePaths, compress: mode === 'compress', cleanupFiles: filePaths });
+      return res.status(202).json({ jobId: job.id });
     } catch (error: any) {
-      log(`Error merging PDFs: ${error.message}`);
+      log(`Error enqueueing merge job: ${error.message}`);
       res.status(500).json({ error: error.message });
     }
   });
 
   // Split PDF - uses qpdf for fast splitting
+  // Split PDF (enqueue)
   app.post("/api/pdf/split", upload.single("file"), validateUpload, async (req, res) => {
-    let outputDir: string | null = null;
     try {
       const file = req.file;
       const mode = (req.body?.mode || req.headers['x-split-mode'] || 'all') as string;
       const ranges = (req.body?.ranges || req.headers['x-split-ranges'] || '') as string;
       const downloadFormat = (req.body?.format || req.headers['x-download-format'] || 'combined') as string;
-
-      if (!file) {
-        return res.status(400).json({ error: "PDF file is required" });
-      }
-
-      log(`Splitting PDF with qpdf, mode: ${mode}, ranges: ${ranges}, format: ${downloadFormat}`);
-      const startTime = Date.now();
-
-      // Split PDF using qpdf
-      const result = await pdfProvider.splitPDF(file.path, mode as any, ranges);
-      outputDir = result.outputDir;
-      
-      const splitTime = Date.now() - startTime;
-
-      // Handle format preference for custom range mode
-      if (mode === 'range' && downloadFormat === 'separate' && result.files.length > 1) {
-        // Multiple files for separate format - create ZIP
-        const downloadId = `split-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-        const downloadPath = path.join(DOWNLOADS_DIR, `${downloadId}.zip`);
-        
-        // Create ZIP using AdmZip
-        const zip = new AdmZip();
-        for (const filePath of result.files) {
-          const fileName = path.basename(filePath);
-          zip.addLocalFile(filePath, '', fileName);
-        }
-        zip.writeZip(downloadPath);
-        
-        const totalTime = Date.now() - startTime;
-        log(`ZIP created for separate format: ${downloadPath} (${result.pageCount} pages in ${totalTime}ms)`);
-
-        // Return ZIP as direct download instead of link (for custom range)
-        const zipBuffer = fs.readFileSync(downloadPath);
-        res.setHeader("Content-Type", "application/zip");
-        res.setHeader("Content-Disposition", `attachment; filename=extracted-pages.zip`);
-        res.setHeader("X-Processing-Time", totalTime.toString());
-        res.setHeader("X-Page-Count", result.pageCount.toString());
-        res.setHeader("X-Format", "separate");
-        res.send(zipBuffer);
-        
-        // Clean up zip file
-        try {
-          fs.unlinkSync(downloadPath);
-        } catch (e) {}
-      } else if (mode === 'range' && downloadFormat === 'combined' && result.files.length > 1) {
-        // Multiple files but user wants combined - merge them
-        log(`Merging ${result.files.length} extracted pages for combined format`);
-        const mergedPDF = await pdfProvider.mergePDFs(result.files);
-        
-        const totalTime = Date.now() - startTime;
-        log(`Pages merged for combined format (${result.pageCount} pages in ${totalTime}ms)`);
-        
-        res.setHeader("Content-Type", "application/pdf");
-        res.setHeader("Content-Disposition", `attachment; filename=extracted-pages.pdf`);
-        res.setHeader("X-Processing-Time", totalTime.toString());
-        res.setHeader("X-Page-Count", result.pageCount.toString());
-        res.setHeader("X-Format", "combined");
-        res.send(mergedPDF);
-      } else if (result.files.length === 1) {
-        // Single file - return as PDF directly (for range mode or single page)
-        const pdfBuffer = fs.readFileSync(result.files[0]);
-        const filename = mode === 'range' ? 'extracted-pages.pdf' : 'extracted-page.pdf';
-        log(`Returning single PDF: ${filename} (${result.pageCount} pages in ${splitTime}ms)`);
-        
-        res.setHeader("Content-Type", "application/pdf");
-        res.setHeader("Content-Disposition", `attachment; filename=${filename}`);
-        res.setHeader("X-Processing-Time", splitTime.toString());
-        res.setHeader("X-Page-Count", result.pageCount.toString());
-        res.setHeader("X-Format", "combined");
-        res.send(pdfBuffer);
-      } else {
-        // Multiple files (all pages mode) - create single ZIP on RAM disk with download link
-        const downloadId = `split-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-        const downloadPath = path.join(DOWNLOADS_DIR, `${downloadId}.zip`);
-        
-        // Create ZIP using AdmZip
-        const zip = new AdmZip();
-        for (const filePath of result.files) {
-          const fileName = path.basename(filePath);
-          zip.addLocalFile(filePath, '', fileName);
-        }
-        zip.writeZip(downloadPath);
-        
-        const totalTime = Date.now() - startTime;
-        log(`ZIP created: ${downloadPath} (${result.pageCount} pages in ${totalTime}ms)`);
-
-        // Return download link
-        res.json({
-          success: true,
-          downloadId,
-          downloadUrl: `/api/pdf/download/${downloadId}`,
-          pageCount: result.pageCount,
-          processingTime: totalTime,
-          expiresIn: 3600
-        });
-      }
+      if (!file) return res.status(400).json({ error: 'PDF file is required' });
+      const queue = getQueue();
+      const job = queue.enqueue('split', { filePath: file.path, mode, ranges, downloadFormat, cleanupFiles: [file.path] });
+      return res.status(202).json({ jobId: job.id });
     } catch (error: any) {
-      log(`Error splitting PDF: ${error.message}`);
+      log(`Error enqueueing split job: ${error.message}`);
       res.status(500).json({ error: error.message });
-    } finally {
-      // Clean up uploaded file
-      if (req.file) {
-        try {
-          fs.unlinkSync(req.file.path);
-        } catch (e) {}
-      }
-      
-      // Clean up temp directory with split PDFs
-      if (outputDir && fs.existsSync(outputDir)) {
-        try {
-          const files = fs.readdirSync(outputDir);
-          for (const f of files) {
-            fs.unlinkSync(path.join(outputDir, f));
-          }
-          fs.rmdirSync(outputDir);
-          log(`Cleaned up temp directory: ${outputDir}`);
-        } catch (e) {}
-      }
     }
   });
 
@@ -354,39 +217,18 @@ export async function registerRoutes(
     }
   });
 
-  // Compress PDF
+  // Compress PDF (enqueue)
   app.post("/api/pdf/compress", upload.single("file"), validateUpload, async (req, res) => {
-    const file = req.file;
     try {
+      const file = req.file;
       const { level } = req.body;
-
-      if (!file) {
-        return res.status(400).json({ error: "PDF file is required" });
-      }
-
-      const startTime = Date.now();
-      log(`Compressing PDF, level: ${level}`);
-
-      const result = await pdfProvider.compressPDF(file.path, level || "recommended");
-      
-      const elapsed = Date.now() - startTime;
-      const reductionPercent = ((1 - result.compressedSize / result.originalSize) * 100).toFixed(1);
-      
-      log(`Compression complete: ${(result.originalSize / 1024 / 1024).toFixed(2)} MB → ${(result.compressedSize / 1024 / 1024).toFixed(2)} MB (${reductionPercent}% reduction) in ${elapsed}ms`);
-
-      res.setHeader("Content-Type", "application/pdf");
-      res.setHeader("Content-Disposition", "attachment; filename=compressed.pdf");
-      res.setHeader("X-Original-Size", result.originalSize.toString());
-      res.setHeader("X-Compressed-Size", result.compressedSize.toString());
-      res.setHeader("X-Elapsed-Time", elapsed.toString());
-      res.send(result.buffer);
+      if (!file) return res.status(400).json({ error: "PDF file is required" });
+      const queue = getQueue();
+      const job = queue.enqueue('compress', { filePath: file.path, level: level || 'recommended', cleanupFiles: [file.path] });
+      return res.status(202).json({ jobId: job.id });
     } catch (error: any) {
-      log(`Error compressing PDF: ${error.message}`);
+      log(`Error enqueueing compress job: ${error.message}`);
       res.status(500).json({ error: error.message });
-    } finally {
-      if (file?.path) {
-        try { fs.unlinkSync(file.path); } catch (e) {}
-      }
     }
   });
 
@@ -813,6 +655,38 @@ export async function registerRoutes(
     }
   });
 
+  // Job status endpoint
+  app.get('/api/jobs/:id', async (req, res) => {
+    try {
+      const id = req.params.id;
+      const queue = getQueue();
+      const job = queue.get(id);
+      if (!job) return res.status(404).json({ error: 'Job not found' });
+      return res.json({ status: job.status, progress: job.progress, error: job.error, downloadUrl: job.outputPath ? `/api/jobs/download/${job.id}` : undefined, createdAt: job.createdAt, startedAt: job.startedAt, finishedAt: job.finishedAt });
+    } catch (e: any) {
+      return res.status(500).json({ error: e.message });
+    }
+  });
+
+  // Job download endpoint
+  app.get('/api/jobs/download/:id', async (req, res) => {
+    try {
+      const id = req.params.id;
+      const queue = getQueue();
+      const job = queue.get(id);
+      if (!job) return res.status(404).json({ error: 'Job not found' });
+      if (job.status !== 'succeeded' || !job.outputPath) return res.status(400).json({ error: 'Job not ready' });
+      // simple path check
+      if (!job.outputPath.startsWith(DOWNLOADS_DIR)) return res.status(403).json({ error: 'Forbidden' });
+      const stream = fs.createReadStream(job.outputPath);
+      res.setHeader('Content-Type', 'application/octet-stream');
+      res.setHeader('Content-Disposition', `attachment; filename=${path.basename(job.outputPath)}`);
+      stream.pipe(res);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   // HTML to PDF - Convert HTML content to PDF using Puppeteer
   app.post("/api/pdf/from-html", async (req, res) => {
     let browser = null;
@@ -908,24 +782,12 @@ export async function registerRoutes(
       // Set HTML content (note: external resources like fonts/images are blocked by interception)
       await page.setContent(content, { waitUntil: 'networkidle0', timeout: 30000 });
 
-      // Generate PDF
-      const pdfBuffer = await page.pdf({
-        format: pageSizeMap[pageSize] || 'A4',
-        landscape: orientation === 'landscape',
-        margin: marginMap[margins] || marginMap['normal'],
-        printBackground: includeBackground
-      });
-
+      // Instead of generating inline, enqueue job for from-html
+      const queue = getQueue();
+      const job = queue.enqueue('from-html', { html: content, options: { pageSize, orientation, margins, includeBackground }, cleanupFiles: [] });
       await browser.close();
       browser = null;
-
-      const elapsed = Date.now() - startTime;
-      log(`PDF generated from ${type} in ${elapsed}ms (${(pdfBuffer.length / 1024).toFixed(1)} KB)`);
-
-      res.setHeader("Content-Type", "application/pdf");
-      res.setHeader("Content-Disposition", "attachment; filename=converted.pdf");
-      res.setHeader("X-Elapsed-Time", elapsed.toString());
-      res.send(Buffer.from(pdfBuffer));
+      return res.status(202).json({ jobId: job.id });
     } catch (error: any) {
       if (browser) {
         try { await browser.close(); } catch {}
@@ -1067,33 +929,10 @@ export async function registerRoutes(
         }
       }
 
-      // Clean up uploaded file
-      try {
-        fs.unlinkSync(file.path);
-      } catch {}
-
-      if (!repairSuccess || !outputPath || !fs.existsSync(outputPath)) {
-        return res.status(500).json({ 
-          error: "Unable to repair PDF. The file may be too damaged or not a valid PDF." 
-        });
-      }
-
-      const elapsed = Date.now() - startTime;
-      log(`PDF repaired using ${usedMethod} in ${elapsed}ms`);
-
-      // Read the repaired file and send it
-      const repairedPdf = fs.readFileSync(outputPath);
-
-      // Clean up temp file
-      try {
-        fs.unlinkSync(outputPath);
-      } catch {}
-
-      res.setHeader("Content-Type", "application/pdf");
-      res.setHeader("Content-Disposition", "attachment; filename=repaired.pdf");
-      res.setHeader("X-Repair-Method", usedMethod);
-      res.setHeader("X-Elapsed-Time", elapsed.toString());
-      res.send(repairedPdf);
+      // instead enqueue repair job
+      const queue = getQueue();
+      const job = queue.enqueue('repair', { filePath: file.path, method, cleanupFiles: [file.path] });
+      return res.status(202).json({ jobId: job.id });
     } catch (error: any) {
       // Clean up on error
       if (outputPath && fs.existsSync(outputPath)) {
@@ -1280,3 +1119,4 @@ export async function registerRoutes(
 
   return httpServer;
 }
+
