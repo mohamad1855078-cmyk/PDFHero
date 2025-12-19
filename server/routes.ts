@@ -11,6 +11,7 @@ import puppeteer from "puppeteer";
 import { createPDFProvider } from "./pdf-provider";
 import { log } from "./index";
 import { escapeHtml, buildSafeHtml } from "./utils/sanitize";
+import validateUpload from './middleware/validateUpload';
 
 // Cache for Chromium path to avoid repeated lookups
 let cachedChromiumPath: string | null = null;
@@ -131,7 +132,7 @@ export async function registerRoutes(
   });
 
   // Merge PDFs
-  app.post("/api/pdf/merge", upload.array("files", 50), async (req, res) => {
+  app.post("/api/pdf/merge", upload.array("files", 50), validateUpload, async (req, res) => {
     try {
       const files = req.files as Express.Multer.File[];
       const mode = (req.body?.mode || 'fast') as 'fast' | 'compress';
@@ -177,7 +178,7 @@ export async function registerRoutes(
   });
 
   // Split PDF - uses qpdf for fast splitting
-  app.post("/api/pdf/split", upload.single("file"), async (req, res) => {
+  app.post("/api/pdf/split", upload.single("file"), validateUpload, async (req, res) => {
     let outputDir: string | null = null;
     try {
       const file = req.file;
@@ -354,7 +355,7 @@ export async function registerRoutes(
   });
 
   // Compress PDF
-  app.post("/api/pdf/compress", upload.single("file"), async (req, res) => {
+  app.post("/api/pdf/compress", upload.single("file"), validateUpload, async (req, res) => {
     const file = req.file;
     try {
       const { level } = req.body;
@@ -390,7 +391,7 @@ export async function registerRoutes(
   });
 
   // Protect PDF
-  app.post("/api/pdf/protect", upload.single("file"), async (req, res) => {
+  app.post("/api/pdf/protect", upload.single("file"), validateUpload, async (req, res) => {
     try {
       const file = req.file;
       const { password } = req.body;
@@ -420,7 +421,7 @@ export async function registerRoutes(
   });
 
   // Unlock/Decrypt PDF
-  app.post("/api/pdf/unlock", upload.single("file"), async (req, res) => {
+  app.post("/api/pdf/unlock", upload.single("file"), validateUpload, async (req, res) => {
     const file = req.file;
     try {
       const { password } = req.body;
@@ -462,7 +463,7 @@ export async function registerRoutes(
   });
 
   // Remove Pages from PDF
-  app.post("/api/pdf/remove-pages", upload.single("file"), async (req, res) => {
+  app.post("/api/pdf/remove-pages", upload.single("file"), validateUpload, async (req, res) => {
     const file = req.file;
     try {
       const { pages } = req.body;
@@ -501,7 +502,7 @@ export async function registerRoutes(
   });
 
   // Rotate Pages in PDF
-  app.post("/api/pdf/rotate", upload.single("file"), async (req, res) => {
+  app.post("/api/pdf/rotate", upload.single("file"), validateUpload, async (req, res) => {
     const file = req.file;
     try {
       if (!file) {
@@ -551,7 +552,7 @@ export async function registerRoutes(
   });
 
   // Organize PDF pages
-  app.post("/api/pdf/organize", upload.single("file"), async (req, res) => {
+  app.post("/api/pdf/organize", upload.single("file"), validateUpload, async (req, res) => {
     const file = req.file;
     try {
       if (!file) {
@@ -592,7 +593,7 @@ export async function registerRoutes(
   });
 
   // Crop PDF pages
-  app.post("/api/pdf/crop", upload.single("file"), async (req, res) => {
+  app.post("/api/pdf/crop", upload.single("file"), validateUpload, async (req, res) => {
     const file = req.file;
     try {
       if (!file) {
@@ -633,7 +634,7 @@ export async function registerRoutes(
   });
 
   // PDF to Word
-  app.post("/api/pdf/to-word", upload.single("file"), async (req, res) => {
+  app.post("/api/pdf/to-word", upload.single("file"), validateUpload, async (req, res) => {
     const file = req.file;
     try {
       if (!file) {
@@ -663,7 +664,7 @@ export async function registerRoutes(
   });
 
   // PDF to Excel
-  app.post("/api/pdf/to-excel", upload.single("file"), async (req, res) => {
+  app.post("/api/pdf/to-excel", upload.single("file"), validateUpload, async (req, res) => {
     const file = req.file;
     try {
       if (!file) {
@@ -693,7 +694,7 @@ export async function registerRoutes(
   });
 
   // PDF to PowerPoint
-  app.post("/api/pdf/to-ppt", upload.single("file"), async (req, res) => {
+  app.post("/api/pdf/to-ppt", upload.single("file"), validateUpload, async (req, res) => {
     const file = req.file;
     try {
       if (!file) {
@@ -935,7 +936,7 @@ export async function registerRoutes(
   });
 
   // Repair PDF - Fix corrupted or damaged PDFs using qpdf and Ghostscript
-  app.post("/api/pdf/repair", upload.single("file"), async (req, res) => {
+  app.post("/api/pdf/repair", upload.single("file"), validateUpload, async (req, res) => {
     let outputPath: string | null = null;
     try {
       const file = req.file;
