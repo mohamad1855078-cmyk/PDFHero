@@ -19,6 +19,7 @@ export interface JobRecord {
   progress?: number;
   outputPath?: string;
   error?: string;
+  errorCode?: string;
   payload?: any;
 }
 
@@ -119,6 +120,7 @@ class InProcessQueue extends EventEmitter {
     } catch (err: any) {
       job.status = 'failed';
       job.error = err?.message || String(err);
+      if (err && (err as any).code) job.errorCode = (err as any).code;
       job.finishedAt = Date.now();
       this.emit('failed', job);
     } finally {
@@ -135,7 +137,7 @@ class InProcessQueue extends EventEmitter {
   private cleanup() {
     const now = Date.now();
     const ttl = this.jobTtlMs;
-    for (const [id, job] of this.jobs.entries()) {
+    this.jobs.forEach((job, id) => {
       if ((job.status === 'succeeded' || job.status === 'failed' || job.status === 'cancelled') && job.finishedAt && now - job.finishedAt > ttl) {
         if (job.outputPath) {
           try { fs.unlinkSync(job.outputPath); } catch (e) {}
@@ -151,7 +153,7 @@ class InProcessQueue extends EventEmitter {
           }
         } catch (e) {}
       }
-    }
+    });
   }
 }
 

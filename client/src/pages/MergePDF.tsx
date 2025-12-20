@@ -76,7 +76,6 @@ export default function MergePDF() {
       });
       return;
     }
-
     setIsProcessing(true);
     setProgress(0);
     setDownloadUrl(null);
@@ -84,9 +83,7 @@ export default function MergePDF() {
 
     try {
       const formData = new FormData();
-      files.forEach(file => {
-        formData.append('files', file);
-      });
+      files.forEach(file => formData.append('files', file));
       formData.append('mode', mergeMode);
 
       const response = await fetch('/api/pdf/merge', {
@@ -95,29 +92,58 @@ export default function MergePDF() {
       });
 
       if (!response.ok) {
-        const error = await response.json();
-        throw new Error(error.error || 'Failed to merge PDFs');
+        const error = await response.json().catch(() => ({}));
+        throw new Error(error?.error || `Merge failed (status ${response.status})`);
       }
 
-      const data = await response.json();
-      
-      // Complete progress
-      setProgress(100);
+      const data = await response.json().catch(() => ({}));
 
-      // Set download URL for user to click
-      setDownloadUrl(data.downloadUrl);
+      // If job was enqueued, poll for status
+      if (response.status === 202 && data.jobId) {
+        const jobId = data.jobId as string;
+        const start = Date.now();
+        const timeoutMs = 2 * 60 * 1000; // 2 minutes
+        const pollInterval = 1500;
 
-      toast({
-        title: "Success!",
-        description: "Your PDFs have been merged successfully. Click the download button to get your file.",
-      });
+        while (Date.now() - start < timeoutMs) {
+          await new Promise((r) => setTimeout(r, pollInterval));
+          const sres = await fetch(`/api/jobs/${jobId}`);
+          if (!sres.ok) {
+            const err = await sres.json().catch(() => ({}));
+            throw new Error(err?.error || `Job status check failed (${sres.status})`);
+          }
+          const sdata = await sres.json().catch(() => ({}));
+          if (sdata.status === 'succeeded' && sdata.downloadUrl) {
+            setProgress(100);
+            setDownloadUrl(sdata.downloadUrl);
+            toast({ title: 'Success!', description: 'Your PDFs have been merged. Click download to get the file.' });
+            return;
+          } else if (sdata.status === 'failed') {
+            // handle structured error from server
+            const err = sdata.error;
+            if (err && typeof err === 'object' && err.code === 'PDF_ENCRYPTED') {
+              throw new Error('One or more uploaded PDFs are password-protected. Please upload unlocked PDFs or use the Unlock tool.');
+            }
+            throw new Error((err && err.message) || sdata.error || 'Merge job failed');
+          }
+          setProgress((p) => Math.min(95, p + 8));
+        }
+
+        throw new Error('Merge timed out; please check job status later.');
+      }
+
+      // Legacy immediate downloadUrl
+      if ((data as any).downloadUrl) {
+        setProgress(100);
+        setDownloadUrl((data as any).downloadUrl);
+        toast({ title: 'Success!', description: 'Your PDFs have been merged successfully. Click the download button to get your file.' });
+        return;
+      }
+
+      throw new Error('Unexpected server response');
     } catch (error: any) {
       console.error('Error merging PDFs:', error);
-      toast({
-        title: "Error",
-        description: error.message || "Failed to merge PDFs. Please try again.",
-        variant: "destructive"
-      });
+      toast({ title: 'Error', description: error.message || 'Failed to merge PDFs. Please try again.', variant: 'destructive' });
     } finally {
       setIsProcessing(false);
     }

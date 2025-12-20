@@ -552,6 +552,13 @@ export class PDFProvider {
             return { pdf, index: i, filePath };
           } catch (fileError: any) {
             log(`Error loading PDF file ${i + 1}: ${fileError.message}`);
+            // Detect encrypted/password-protected PDFs from pdf-lib error messages
+            const msg = String(fileError.message || '').toLowerCase();
+            if (msg.includes('encrypted') || msg.includes('password') || msg.includes('ignoreencryption')) {
+              const e: any = new Error('Uploaded PDF is password-protected or encrypted');
+              e.code = 'PDF_ENCRYPTED';
+              throw e;
+            }
             throw new Error(`File ${i + 1} is invalid or corrupted: ${fileError.message}`);
           }
         })()
