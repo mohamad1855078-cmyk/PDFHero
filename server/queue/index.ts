@@ -1,7 +1,7 @@
 import { EventEmitter } from 'events';
 import fs from 'fs';
 import path from 'path';
-import { v4 as uuidv4 } from 'uuid';
+import { randomUUID } from 'crypto';
 import archiver from 'archiver';
 import { log } from '../index';
 
@@ -51,7 +51,7 @@ class InProcessQueue extends EventEmitter {
   }
 
   enqueue(type: string, payload: any): JobRecord {
-    const id = uuidv4();
+    const id = randomUUID();
     const rec: JobRecord = { id, type, status: 'queued', createdAt: Date.now(), payload };
     this.jobs.set(id, rec);
     this.queue.push(id);
