@@ -2,9 +2,10 @@ import fs from 'fs';
 import path from 'path';
 import { RequestHandler } from 'express';
 
-const DEFAULT_MAX_FILE = 30 * 1024 * 1024; // 30 MB
-const DEFAULT_MAX_TOTAL = 120 * 1024 * 1024; // 120 MB
-const DEFAULT_MAX_FILES = 10;
+const DEFAULT_MAX_FILE = 500 * 1024 * 1024; // 500 MB
+const DEFAULT_MAX_FILES = 50;
+// default total = max files * max file size (50 * 500MB = 25 GB)
+const DEFAULT_MAX_TOTAL = DEFAULT_MAX_FILES * DEFAULT_MAX_FILE; // 25 GB
 
 export function getEnvLimits() {
   const maxFile = parseInt(process.env.UPLOAD_MAX_FILE_SIZE || '') || DEFAULT_MAX_FILE;
