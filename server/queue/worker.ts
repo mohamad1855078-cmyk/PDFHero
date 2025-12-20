@@ -12,6 +12,9 @@ export function startWorker() {
   const processor = async (job: JobRecord) => {
     log(`[worker] Processing job ${job.id} type=${job.type}`);
     try {
+      // attach clientKey from payload if present
+      const clientKey = job.payload && job.payload.clientKey;
+      if (clientKey) job.payload.clientKey = clientKey;
       if (job.type === 'merge') {
         const filePaths: string[] = job.payload.filePaths;
         const buffer = await pdfProvider.mergePDFs(filePaths, { compress: job.payload.compress });
