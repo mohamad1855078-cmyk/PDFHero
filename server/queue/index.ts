@@ -25,16 +25,24 @@ export interface JobRecord {
 class InProcessQueue extends EventEmitter {
   private jobs = new Map<string, JobRecord>();
   private queue: string[] = [];
+  private queuedByKey = new Map<string, number>();
+  private runningByKey = new Map<string, number>();
   private concurrency: number;
   private running = 0;
   private processor: (job: JobRecord) => Promise<void>;
   private jobTimeoutMs: number;
+  private maxPerUser: number;
+  private jobTtlMs: number;
+  private outputTtlMs: number;
 
   constructor(processor: (job: JobRecord) => Promise<void>, concurrency = 2, jobTimeoutMs = 5 * 60 * 1000) {
     super();
     this.processor = processor;
     this.concurrency = concurrency;
     this.jobTimeoutMs = jobTimeoutMs;
+    this.maxPerUser = parseInt(process.env.QUEUE_MAX_PER_USER || '') || 1;
+    this.jobTtlMs = parseInt(process.env.JOB_TTL_MS || '') || 1000 * 60 * 60; // 1h
+    this.outputTtlMs = parseInt(process.env.OUTPUT_TTL_MS || '') || 1000 * 60 * 60; // 1h
 
     // periodic cleanup of finished jobs older than TTL
     const t = setInterval(() => this.cleanup(), 60 * 1000);
@@ -47,9 +55,19 @@ class InProcessQueue extends EventEmitter {
     const rec: JobRecord = { id, type, status: 'queued', createdAt: Date.now(), payload };
     this.jobs.set(id, rec);
     this.queue.push(id);
+    // track queued by key
+    const key = (payload && payload.clientKey) || 'anon';
+    this.queuedByKey.set(key, (this.queuedByKey.get(key) || 0) + 1);
     this.emit('enqueue', rec);
     this.maybeStart();
     return rec;
+  }
+
+  canEnqueueFor(key?: string) {
+    const k = key || 'anon';
+    const running = this.runningByKey.get(k) || 0;
+    const queued = this.queuedByKey.get(k) || 0;
+    return (running + queued) < (this.maxPerUser + Math.max(1, this.concurrency));
   }
 
   get(id: string) {
@@ -65,6 +83,17 @@ class InProcessQueue extends EventEmitter {
       const id = this.queue.shift()!;
       const job = this.jobs.get(id);
       if (!job) continue;
+      // decrement queuedByKey before running
+      const key = (job.payload && job.payload.clientKey) || 'anon';
+      this.queuedByKey.set(key, Math.max(0, (this.queuedByKey.get(key) || 1) - 1));
+      // enforce per-user cap at start time
+      const runningFor = this.runningByKey.get(key) || 0;
+      if (runningFor >= this.maxPerUser) {
+        // re-queue to end to avoid starvation
+        this.queue.push(id);
+        continue;
+      }
+      this.runningByKey.set(key, runningFor + 1);
       this.run(job).catch((e) => log(`Job runner error: ${e?.message || e}`));
     }
   }
@@ -95,6 +124,9 @@ class InProcessQueue extends EventEmitter {
     } finally {
       clearTimeout(timer);
       this.running--;
+      // decrement runningByKey
+      const key = (job.payload && job.payload.clientKey) || 'anon';
+      this.runningByKey.set(key, Math.max(0, (this.runningByKey.get(key) || 1) - 1));
       this.maybeStart();
     }
   }
@@ -102,13 +134,22 @@ class InProcessQueue extends EventEmitter {
   // Remove old finished jobs and their output files
   private cleanup() {
     const now = Date.now();
-    const ttl = 1000 * 60 * 60; // 1 hour
+    const ttl = this.jobTtlMs;
     for (const [id, job] of this.jobs.entries()) {
       if ((job.status === 'succeeded' || job.status === 'failed' || job.status === 'cancelled') && job.finishedAt && now - job.finishedAt > ttl) {
         if (job.outputPath) {
           try { fs.unlinkSync(job.outputPath); } catch (e) {}
         }
         this.jobs.delete(id);
+      }
+      // also cleanup orphaned output files older than outputTtlMs
+      if (job.outputPath && fs.existsSync(job.outputPath)) {
+        try {
+          const stats = fs.statSync(job.outputPath);
+          if (now - stats.mtimeMs > this.outputTtlMs) {
+            try { fs.unlinkSync(job.outputPath); } catch (e) {}
+          }
+        } catch (e) {}
       }
     }
   }
@@ -119,6 +160,23 @@ let QUEUE: InProcessQueue | null = null;
 export function initQueue(processor: (job: JobRecord) => Promise<void>, concurrency = 2, jobTimeoutMs = 5 * 60 * 1000) {
   if (!QUEUE) QUEUE = new InProcessQueue(processor, concurrency, jobTimeoutMs);
   return QUEUE;
+}
+
+// Admin helpers
+export function forceCleanup() {
+  if (!QUEUE) return false;
+  // run cleanup synchronously
+  (QUEUE as any).cleanup();
+  return true;
+}
+
+export function metrics() {
+  if (!QUEUE) return null;
+  return {
+    jobs: (QUEUE as any).list(),
+    concurrency: (QUEUE as any).concurrency,
+    running: (QUEUE as any).running,
+  };
 }
 
 export function getQueue() {

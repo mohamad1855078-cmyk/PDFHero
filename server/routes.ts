@@ -12,6 +12,8 @@ import { createPDFProvider } from "./pdf-provider";
 import { log } from "./index";
 import { escapeHtml, buildSafeHtml } from "./utils/sanitize";
 import validateUpload from './middleware/validateUpload';
+import rateLimit from './middleware/rateLimit';
+import { metrics as queueMetrics, forceCleanup as queueForceCleanup } from './queue/index';
 import { initQueue, getQueue } from './queue/index';
 import { startWorker, getWorkerQueue } from './queue/worker';
 
@@ -134,6 +136,9 @@ export async function registerRoutes(
   app.get("/api/health", (_req, res) => {
     res.json({ status: "ok", provider: process.env.PDF_PROVIDER || "mock" });
   });
+
+  // Rate limiting applied globally
+  app.use(rateLimit);
 
   // Merge PDFs (enqueue)
   app.post("/api/pdf/merge", upload.array("files", 50), validateUpload, async (req, res) => {
@@ -685,6 +690,22 @@ export async function registerRoutes(
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
+  });
+
+  // Admin: fetch job metrics (protected by ADMIN_API_KEY)
+  app.get('/api/admin/jobs/metrics', (req, res) => {
+    const key = req.headers['x-admin-key'] as string;
+    if (!process.env.ADMIN_API_KEY || key !== process.env.ADMIN_API_KEY) return res.status(403).json({ error: 'forbidden' });
+    const m = queueMetrics();
+    return res.json(m);
+  });
+
+  // Admin: force cleanup
+  app.post('/api/admin/jobs/cleanup', (req, res) => {
+    const key = req.headers['x-admin-key'] as string;
+    if (!process.env.ADMIN_API_KEY || key !== process.env.ADMIN_API_KEY) return res.status(403).json({ error: 'forbidden' });
+    const ok = queueForceCleanup();
+    return res.json({ ok });
   });
 
   // HTML to PDF - Convert HTML content to PDF using Puppeteer
